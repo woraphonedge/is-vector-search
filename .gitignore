@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+.envrc
+
+# Project data and caches
+hermes_db/
+file_storage/
+chroma-data/
+.data/
+pytest_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data files
+*.pdf
+*.json
+*.parquet
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*

@@ -1,0 +1,11 @@
+services:
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chroma-is-file-search
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./hermes_db:/chroma
+    command: "run --host 0.0.0.0 --port 8000 --path /chroma"
+    environment:
+      - IS_PERSISTENT=TRUE

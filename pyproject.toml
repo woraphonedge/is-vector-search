@@ -1,0 +1,63 @@
+[project]
+name = "is-vector-search"
+version = "0.1.0"
+description = "Simple FastAPI service with an async endpoint calling Gemini API via HTTP."
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Core runtime dependencies
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "httpx>=0.27.0",
+  "python-dotenv>=1.0.0",
+  "pydantic>=2.0.0",
+  "google-genai>=0.3.0",
+  "google>=3.0.0",
+  "pandas>=2.0.0",
+  "pyarrow>=17.0.0",
+  "python-multipart>=0.0.20",
+  "agentic-doc>=0.1.0",
+  "tiktoken>=0.7.0",
+  "langchain-core>=1,<2",
+  "langchain-openai",
+  "langchain-community>=0.3.21",
+  "langchain-chroma>=1,<2",
+  "chromadb",
+  "supabase>=2.18.0",
+  "langchain>=1,<2",
+  "chroma>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+start = "app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["notebooks*", "tests*"]
+
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+lint.select = [
+    "E", # errors
+    "F", # flake8 errors
+    "I", # import-related errors
+    "W", # Pycodestyle warnings
+    "B", # Bugbear warnings
+]
+lint.ignore = [
+    "E501",
+    "E402", # import not at top of file
+    "B008", # function-call-in-default-argument
+    "F541", # f-string without any placeholders
+]
+

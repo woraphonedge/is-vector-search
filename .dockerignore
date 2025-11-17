@@ -1,0 +1,23 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local data not needed in image build
+hermes_db/
+file_storage/
+chroma-data/
+.data/
+
+# Env and config secrets
+.env
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
