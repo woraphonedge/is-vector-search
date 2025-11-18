@@ -110,8 +110,8 @@ class FileSearchUploadResponse(BaseModel):
 
 
 class FileSearchQueryRequest(BaseModel):
-    store_name: str
     query: str
+    store_name: str = os.getenv("FILE_SEARCH_STORE_NAME")
     model: str = "gemini-2.5-flash"
 
 
