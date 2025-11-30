@@ -32,14 +32,39 @@ def prepare_document(
     base_name = re.sub(r"\W+", "_", file_name.rsplit(".", 1)[0]).lower()
 
     # Step 1: Pre-process all individual chunks to ensure none exceed TOKEN_LIMIT.
+    # Support both the legacy agentic-doc schema and the new landingai_ade ParseResponse schema.
     pre_processed_chunks = []
     for item in parsed_json.get("chunks", []):
-        if item["chunk_type"] == "marginalia" or len(item["text"]) < 20:
+        # --- Normalize schema fields ---
+        # source_chunk_type: legacy uses "chunk_type"; ADE uses "type" (e.g. "chunkText", "chunkMarginalia").
+        source_chunk_type = item.get("chunk_type") or item.get("type", "")
+
+        # text content: legacy uses "text"; ADE uses "markdown".
+        text = item.get("text") or item.get("markdown", "")
+
+        # grounding/page: legacy uses a list of groundings; ADE uses a single object.
+        grounding = item.get("grounding")
+        page_no = None
+        if isinstance(grounding, list) and grounding:
+            page_no = grounding[0].get("page")
+        elif isinstance(grounding, dict):
+            page_no = grounding.get("page")
+
+        # chunk id: legacy uses "chunk_id"; ADE uses "id".
+        original_chunk_id = item.get("chunk_id") or item.get("id")
+
+        # Skip if we don't have essential fields
+        if not text or page_no is None or original_chunk_id is None:
             continue
 
-        text = item["text"]
-        page_no = item["grounding"][0]["page"]
-        original_chunk_id = item["chunk_id"]
+        # Skip marginalia / non-primary text chunks
+        if source_chunk_type:
+            lowered = str(source_chunk_type).lower()
+            if "marginalia" in lowered:
+                continue
+
+        if len(text) < 20:
+            continue
         tokens = tokenizer.encode(text, allowed_special={"<space>"})
 
         if len(tokens) > TOKEN_LIMIT:

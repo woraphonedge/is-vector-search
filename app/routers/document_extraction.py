@@ -1,10 +1,10 @@
 import datetime
 import hashlib
 import json
+import logging
 import os
 from typing import List
 
-from agentic_doc.parse import parse
 from fastapi import (
     APIRouter,
     Body,
@@ -15,6 +15,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from landingai_ade import LandingAIADE
 
 from app.models import (
     ChatRequest,
@@ -32,6 +33,10 @@ from app.utils.supabase_db import SupabaseDatabase
 
 router = APIRouter()
 
+logger = logging.getLogger("is_vector_search")
+
+ade_client = LandingAIADE(apikey=os.getenv("VISION_AGENT_API_KEY"))
+
 
 def get_supabase_db():
     """FastAPI dependency to get Supabase database instance."""
@@ -48,7 +53,7 @@ def list_parsed_documents(
     db: SupabaseDatabase = Depends(get_supabase_db),
 ):  # noqa: B008
     metadata_list = db.get_all_metadata()
-    print(f"Metadata list: {metadata_list}")
+    logger.info("Retrieved %d metadata records", len(metadata_list))
     res = [
         DocumentMetadata(
             id=metadata.id,
@@ -338,22 +343,23 @@ async def extract_document_from_api(
 
 async def call_landing_ai_parser(file_content: bytes) -> dict:
     api_key = os.getenv("VISION_AGENT_API_KEY")
-    # raise ValueError("Data quality check failed: Input data is invalid.")
-    if api_key:
-        try:
-            # Use the actual API call
-            result = parse(documents=file_content, result_save_dir="hermes_db")
-            with open(result[0].result_path, "r") as f:
-                parsed_doc = json.load(f)
-            return parsed_doc
-        except Exception as e:
-            print(f"Error calling Landing AI API: {e}")
-            # Fallback to mock data in case of API error
-            pass
+    if not api_key:
+        raise ValueError(
+            "No API key found. Please set the VISION_AGENT_API_KEY environment variable."
+        )
 
-    raise ValueError(
-        "No API key found. Please set the VISION_AGENT_API_KEY environment variable."
-    )
+    try:
+        # Use the new landingai_ade client
+        # The client accepts bytes directly for document parameter
+        response = ade_client.parse(
+            document=file_content,
+            model="dpt-2",
+        )
+        # Convert Pydantic response to dict
+        return response.to_dict()
+    except Exception as e:
+        print(f"Error calling Landing AI API: {e}")
+        raise
 
 
 @router.post("/chat", response_model=ChatResponse)

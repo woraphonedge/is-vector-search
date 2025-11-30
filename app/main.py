@@ -1,3 +1,4 @@
+import logging
 import os
 import tempfile
 import time
@@ -12,6 +13,16 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+# Load environment variables before importing modules that depend on them
+load_dotenv()
+
+# Configure application-wide logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("is_vector_search")
+
 from app.hermes import (
     HermesUploadRequest,
     hermes_upload_logic,
@@ -20,9 +31,6 @@ from app.hermes import (
 )
 from app.routers import document_extraction
 from app.utils.supabase_db import initialize_env
-
-# Load environment variables
-load_dotenv()
 
 
 @asynccontextmanager

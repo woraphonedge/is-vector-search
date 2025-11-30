@@ -10,10 +10,10 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.embeddings import DeepInfraEmbeddings
 from langchain_openai import ChatOpenAI
+from supabase import Client, create_client
 
 from app.config import FILE_STORAGE_DIR
 from app.models import DocumentMetadata
-from supabase import Client, create_client
 
 # Global variables for initialization
 DEEP_INFRA_API_KEY = None
@@ -134,8 +134,6 @@ def initialize_env():
                 )
 
     # Portfolio datasets shape adjustments
-    import numpy as _np
-
     df_tran = df_tran.sort_values(
         by=["trade_date", "asset_class", "src_symbol"], ascending=[True, True, True]
     )
@@ -319,8 +317,24 @@ class SupabaseDatabase:
 
             # 1. Delete the parsed JSON file
             try:
-                if metadata.json_file_path and os.path.exists(metadata.json_file_path):
-                    os.remove(metadata.json_file_path)
+                if metadata.json_file_path:
+                    # New scheme: JSON stored in Supabase Storage under the 'parsed-json' bucket
+                    # with a virtual URI like 'supabase://parsed-json/<md5>.json'.
+                    if metadata.json_file_path.startswith("supabase://parsed-json/"):
+                        filename = metadata.json_file_path.replace(
+                            "supabase://parsed-json/", ""
+                        )
+                        try:
+                            self.supabase.storage.from_("parsed-json").remove(
+                                [filename]
+                            )
+                        except Exception as e:
+                            print(
+                                f"Error deleting JSON from Supabase 'parsed-json' bucket ({filename}): {e}"
+                            )
+                    # Backward compatibility: local filesystem path
+                    elif os.path.exists(metadata.json_file_path):
+                        os.remove(metadata.json_file_path)
             except OSError as e:
                 print(f"Error deleting JSON file {metadata.json_file_path}: {e}")
 

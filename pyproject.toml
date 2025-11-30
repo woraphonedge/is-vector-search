@@ -17,7 +17,6 @@ dependencies = [
   "pandas>=2.0.0",
   "pyarrow>=17.0.0",
   "python-multipart>=0.0.20",
-  "agentic-doc>=0.1.0",
   "tiktoken>=0.7.0",
   "langchain-core>=1,<2",
   "langchain-openai",
@@ -27,6 +26,7 @@ dependencies = [
   "supabase>=2.18.0",
   "langchain>=1,<2",
   "chroma>=0.2.0",
+  "landingai-ade>=1.0.0",
 ]
 
 [project.optional-dependencies]
