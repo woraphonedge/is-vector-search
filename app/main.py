@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     """Load Hermes parquet once at startup and cache in app.state."""
     hermes_path = os.getenv(
         "HERMES_PARQUET_PATH",
-        "/Users/home/projects/mcp-server/data/hermes_files_conso.parquet",
+        "./data/hermes_files_conso.parquet",
     )
 
     try:

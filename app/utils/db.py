@@ -29,10 +29,13 @@ def initialize_env():
     DEEP_INFRA_API_KEY = os.getenv("DEEP_INFRA_API_KEY")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     CHROMA_HOST = os.getenv("CHROMA_HOST")
+    MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-mini")
+    MODEL_REASONING_EFFORT = os.getenv("MODEL_REASONING_EFFORT", "low")
+    MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.7"))
 
     # Initialize vector store
     embeddings = DeepInfraEmbeddings(
-        model_id="BAAI/bge-m3",
+        model_id=MODEL_NAME,
         query_instruction="",
         embed_instruction="",
         deepinfra_api_token=DEEP_INFRA_API_KEY,
@@ -43,9 +46,20 @@ def initialize_env():
         collection_name="example_collection",
         embedding_function=embeddings,
     )
-
-    # LLM for chat
-    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.1, openai_api_key=OPENAI_API_KEY)
+    if MODEL_NAME == 'gpt-4.1-mini':
+        llm = ChatOpenAI(
+            model=MODEL_NAME,
+            temperature=MODEL_TEMPERATURE,
+            openai_api_key=OPENAI_API_KEY,
+        )
+    else:
+        # LLM for chat
+        llm = ChatOpenAI(
+            model=MODEL_NAME,
+            temperature=MODEL_TEMPERATURE,
+            openai_api_key=OPENAI_API_KEY,
+            reasoning_effort=MODEL_REASONING_EFFORT
+        )
 
 class Database:
     def __init__(self):
