@@ -19,7 +19,7 @@ venv/
 hermes_db/
 file_storage/
 chroma-data/
-.data/
+data/
 pytest_cache/
 .mypy_cache/
 .pytest_cache/
