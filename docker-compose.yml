@@ -12,6 +12,25 @@ services:
     networks:
       - kkps-network
 
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-is-vector-search
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=vector_search
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    networks:
+      - kkps-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 networks:
   kkps-network:
     external: true
