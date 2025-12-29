@@ -1,6 +1,6 @@
+import asyncio
 import os
 import tempfile
-import time
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from google.genai import types
@@ -50,7 +50,7 @@ async def upload_file_to_store(
     )
 
     while not upload_op.done:
-        time.sleep(5)
+        await asyncio.sleep(5)
         upload_op = genai_client.operations.get(upload_op)
 
     return FileSearchUploadResponse(
