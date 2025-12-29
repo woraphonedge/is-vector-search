@@ -2,6 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import asyncpg
 import pandas as pd
 from fastapi import FastAPI
 
@@ -73,4 +74,47 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("No genai_client available to create file search store")
 
+    # Initialize PostgreSQL connection pool
+    try:
+        pg_host = os.getenv("POSTGRES_HOST")
+        pg_port = os.getenv("POSTGRES_PORT")
+        pg_db = os.getenv("POSTGRES_DB")
+        pg_user = os.getenv("POSTGRES_USER")
+        pg_password = os.getenv("POSTGRES_PASSWORD")
+
+        missing = [
+            name
+            for name, val in (
+                ("POSTGRES_HOST", pg_host),
+                ("POSTGRES_PORT", pg_port),
+                ("POSTGRES_DB", pg_db),
+                ("POSTGRES_USER", pg_user),
+                ("POSTGRES_PASSWORD", pg_password),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                "Missing required Postgres env vars: " + ", ".join(missing)
+            )
+
+        app.state.db_pool = await asyncpg.create_pool(
+            host=pg_host,
+            port=int(pg_port),
+            database=pg_db,
+            user=pg_user,
+            password=pg_password,
+            min_size=5,
+            max_size=20,
+        )
+        logger.info("PostgreSQL connection pool created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create PostgreSQL connection pool: {e}")
+        # Continue without PostgreSQL - vector search endpoints will fail
+
     yield
+
+    # Cleanup: Close PostgreSQL connection pool
+    if hasattr(app.state, "db_pool"):
+        await app.state.db_pool.close()
+        logger.info("PostgreSQL connection pool closed")

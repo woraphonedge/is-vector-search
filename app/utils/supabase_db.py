@@ -1,11 +1,9 @@
 import json
 import os
 from datetime import datetime
-from io import BytesIO
 from typing import List, Optional
 
 import chromadb
-import pandas as pd
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.embeddings import DeepInfraEmbeddings
@@ -28,32 +26,18 @@ client = None
 vector_store = None
 llm = None
 supabase: Optional[Client] = None
-df_hermes = None
-df_instrument = None
-df_phatrax = None
-df_out = None
-df_tran = None
-df_cust = None
 
 
 def initialize_env():
     """Initializes the environment by loading variables from .env."""
     global DEEP_INFRA_API_KEY, OPENAI_API_KEY, CHROMA_HOST, SUPABASE_URL, SUPABASE_KEY
     global embeddings, client, vector_store, llm, supabase
-    global df_hermes, df_instrument, df_phatrax, df_out, df_tran, df_cust
     load_dotenv()
     DEEP_INFRA_API_KEY = os.getenv("DEEP_INFRA_API_KEY")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     CHROMA_HOST = os.getenv("CHROMA_HOST")
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_KEY")
-    USE_SUPABASE_AS_SOURCE = (
-        os.getenv("USE_SUPABASE_AS_SOURCE", "True").lower() == "true"
-    )
-    SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "mcp")
-    SUPABASE_STORAGE_PREFIX = os.getenv(
-        "SUPABASE_STORAGE_PREFIX", ""
-    )  # e.g. "data" or ""
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env file")
@@ -79,97 +63,6 @@ def initialize_env():
     llm = ChatOpenAI(
         model="gpt-4.1-mini", temperature=0.1, openai_api_key=OPENAI_API_KEY
     )
-
-    def _download_parquet_from_storage(filename: str) -> pd.DataFrame:
-        path = (
-            f"{SUPABASE_STORAGE_PREFIX}/{filename}"
-            if SUPABASE_STORAGE_PREFIX
-            else filename
-        )
-        content = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).download(path)
-        return pd.read_parquet(BytesIO(content))
-
-    if USE_SUPABASE_AS_SOURCE:
-        # From Supabase Storage bucket
-        df_hermes = _download_parquet_from_storage("hermes_files_conso.parquet")
-        df_instrument = _download_parquet_from_storage("df_instrument_all.parquet")
-        df_phatrax = _download_parquet_from_storage("df_phatrax.parquet")
-        df_out = _download_parquet_from_storage("df_out_new.parquet")
-        df_tran = _download_parquet_from_storage("df_tran.parquet")
-        df_cust = _download_parquet_from_storage("df_cust_mock.parquet")
-    else:
-        # From local filesystem under data/
-        df_hermes = pd.read_parquet("data/hermes_files_conso.parquet")
-        df_instrument = pd.read_parquet("data/df_instrument_all.parquet")
-        df_phatrax = pd.read_parquet("data/df_phatrax.parquet")
-        df_out = pd.read_parquet("data/df_out.parquet")
-        df_tran = pd.read_parquet("data/df_tran.parquet")
-        df_cust = pd.read_parquet("data/df_cust_mock.parquet")
-
-    # Post-load normalizations matching existing tool expectations
-    if "pageSections_description_for_chatbot" in df_hermes.columns:
-        df_hermes["pageSections_description_for_chatbot"] = df_hermes[
-            "pageSections_description_for_chatbot"
-        ].fillna("")
-
-    # Instrument dataset normalization for MarketData tools
-    if df_instrument is not None:
-        if "symbol" in df_instrument.columns:
-            df_instrument["symbol"] = df_instrument["symbol"].astype(str)
-        # Ensure symbol_norm exists for fuzzy search
-        if (
-            "symbol_norm" not in df_instrument.columns
-            and "symbol" in df_instrument.columns
-        ):
-            df_instrument["symbol_norm"] = (
-                df_instrument["symbol"]
-                .str.replace(r"[^A-Za-z0-9]", "", regex=True)
-                .str.lower()
-            )
-        # Parse top pick dates if present
-        for _col in ("top_pick_since", "top_pick_until"):
-            if _col in df_instrument.columns:
-                df_instrument[_col] = pd.to_datetime(
-                    df_instrument[_col], errors="coerce"
-                )
-
-    # Portfolio datasets shape adjustments
-    df_tran = df_tran.sort_values(
-        by=["trade_date", "asset_class", "src_symbol"], ascending=[True, True, True]
-    )
-    # Convert to JSON-friendly dict
-    df_out = df_out.where(pd.notnull(df_out), None)
-    df_out["expected_return"] = df_out["expected_return"].fillna(0)
-    if "trade_date" in df_tran.columns:
-        df_tran["trade_date"] = pd.to_datetime(
-            df_tran["trade_date"]
-        )  # used later with dt.strftime
-    if "client_open_date" in df_cust.columns:
-        df_cust["client_open_date"] = pd.to_datetime(df_cust["client_open_date"])
-    # Keep column rename and typing consistent with tools
-    if "client_first_name_en" in df_cust.columns:
-        df_cust = df_cust.rename(columns={"client_first_name_en": "customer_name"})
-    if "customer_id" in df_cust.columns:
-        df_cust["customer_id"] = df_cust["customer_id"].astype(str)
-
-
-def normalize_instrument_output(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a copy of the given instrument DataFrame with:
-    - date columns ('top_pick_since', 'top_pick_until') converted to ISO strings (YYYY-MM-DD), NaT -> None
-    Note: 'mfet_data' parsing is no longer needed because instrument metadata is flattened into columns.
-    """
-    df_copy = df.copy()
-    # Convert date columns to ISO strings (python str) with None for missing
-    for date_col in ("top_pick_since", "top_pick_until"):
-        if date_col in df_copy.columns:
-            ser = pd.to_datetime(df_copy[date_col], errors="coerce").dt.strftime(
-                "%Y-%m-%d"
-            )
-            # ser will contain strings and NaT; convert NaT/NaN to None explicitly
-            df_copy[date_col] = ser.where(ser.notna(), None)
-
-    return df_copy
 
 
 class SupabaseDatabase:
