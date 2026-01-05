@@ -1,12 +1,10 @@
 import logging
-import os
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Request
-from langchain_community.embeddings import DeepInfraEmbeddings
 from pydantic import BaseModel
 
 load_dotenv()
@@ -101,7 +99,6 @@ def _parse_embedding_value(value: Any) -> List[float]:
 
 
 def _mmr_select(
-    query_emb: List[float],
     candidates: List[dict],
     k: int,
     lambd: float,
@@ -112,44 +109,49 @@ def _mmr_select(
     if k <= 0 or not candidates:
         return []
 
+    # Greedy MMR over the *candidate set only*.
+    # Complexity: O(k * |candidates|) cosine computations by incrementally
+    # updating each candidate's max similarity to the selected set.
     selected: List[dict] = []
-    selected_embs: List[List[float]] = []
-
     remaining = candidates[:]
 
+    # Track, for each remaining candidate, its max similarity to any selected item.
+    max_sim_to_selected: dict[int, float] = {id(c): 0.0 for c in remaining}
+
     while remaining and len(selected) < k:
-        best = None
+        best_idx = 0
         best_score = -1e18
 
-        for cand in remaining:
+        for i, cand in enumerate(remaining):
             rel = float(cand["similarity"])
-            cand_emb = cand["embedding"]
-
-            if not selected_embs:
-                div = 0.0
-            else:
-                div = max(_cosine(cand_emb, e) for e in selected_embs)
-
+            div = float(max_sim_to_selected.get(id(cand), 0.0))
             mmr_score = (lambd * rel) - ((1.0 - lambd) * div)
             if mmr_score > best_score:
                 best_score = mmr_score
-                best = cand
+                best_idx = i
 
+        best = remaining.pop(best_idx)
         selected.append(best)
-        selected_embs.append(best["embedding"])
-        remaining.remove(best)
+
+        best_emb = best["embedding"]
+        for cand in remaining:
+            prev = float(max_sim_to_selected.get(id(cand), 0.0))
+            sim = _cosine(cand["embedding"], best_emb)
+            if sim > prev:
+                max_sim_to_selected[id(cand)] = sim
 
     return selected
 
 
-async def get_embeddings_model():
-    """Get the embeddings model instance"""
-    return DeepInfraEmbeddings(
-        model_id="BAAI/bge-m3",
-        query_instruction="",
-        embed_instruction="",
-        deepinfra_api_token=os.getenv("DEEP_INFRA_API_KEY"),
-    )
+async def get_embeddings_model(request: Request):
+    """Dependency to get embeddings model from app state"""
+    embeddings_model = getattr(request.app.state, "embeddings_model", None)
+    if embeddings_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Embeddings model not initialized. Please ensure the application has started properly.",
+        )
+    return embeddings_model
 
 
 async def get_db_pool(request: Request):
@@ -348,7 +350,6 @@ async def search_vectors(
             if use_mmr:
                 mmr_lambda = 0.5 if request_data.search_mode == "general" else 0.9
                 selected = _mmr_select(
-                    query_emb=list(map(float, query_embedding)),
                     candidates=candidates,
                     k=request_data.limit,
                     lambd=float(mmr_lambda),

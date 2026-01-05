@@ -38,7 +38,7 @@ class EmbeddingsProvider:
                 logger.warning(f"OpenRouter embeddings failed, falling back: {e}")
 
         if self._deepinfra_model:
-            return await self._deepinfra_model.aembed_query(text)
+            return self._deepinfra_model.embed_query(text)
 
         raise RuntimeError("No embeddings provider configured")
 
