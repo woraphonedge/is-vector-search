@@ -14,9 +14,17 @@ def _get_pdf_path(file_md5_checksum: str) -> Path:
     path = _find_uploaded_file_path(file_md5_checksum)
     if not path:
         raise HTTPException(status_code=404, detail="file not found")
-    if path.suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="file is not a pdf")
-    return path
+
+    if path.suffix.lower() == ".pdf":
+        return path
+
+    # If multiple artifacts exist with the same checksum prefix (e.g. .json, .pdf),
+    # prefer a real PDF if present.
+    pdf_candidate = path.with_suffix(".pdf")
+    if pdf_candidate.exists() and pdf_candidate.is_file():
+        return pdf_candidate
+
+    raise HTTPException(status_code=400, detail="file is not a pdf")
 
 
 @router.get("/original")
