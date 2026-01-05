@@ -295,8 +295,9 @@ async def search_vectors(
 
             if request_data.regex_search:
                 query += " AND (content ~* ${} OR file_name ~* ${})".format(
-                    len(params) + 1, len(params) + 1
+                    len(params) + 1, len(params) + 2
                 )
+                params.append(request_data.regex_search)
                 params.append(request_data.regex_search)
 
             # Whitelist of allowed filter keys to prevent SQL injection
