@@ -5,10 +5,42 @@ from contextlib import asynccontextmanager
 import asyncpg
 import pandas as pd
 from fastapi import FastAPI
-
-from app.utils.supabase_db import initialize_env
+from langchain_community.embeddings import DeepInfraEmbeddings
+from openai import AsyncOpenAI
 
 logger = logging.getLogger("is_vector_search")
+
+
+class EmbeddingsProvider:
+    def __init__(
+        self,
+        openrouter_client: AsyncOpenAI | None,
+        openrouter_model: str | None,
+        openrouter_extra_headers: dict[str, str] | None,
+        deepinfra_model: DeepInfraEmbeddings | None,
+    ):
+        self._openrouter_client = openrouter_client
+        self._openrouter_model = openrouter_model
+        self._openrouter_extra_headers = openrouter_extra_headers
+        self._deepinfra_model = deepinfra_model
+
+    async def aembed_query(self, text: str):
+        if self._openrouter_client and self._openrouter_model:
+            try:
+                resp = await self._openrouter_client.embeddings.create(
+                    model=self._openrouter_model,
+                    input=text,
+                    encoding_format="float",
+                    extra_headers=self._openrouter_extra_headers,
+                )
+                return resp.data[0].embedding
+            except Exception as e:
+                logger.warning(f"OpenRouter embeddings failed, falling back: {e}")
+
+        if self._deepinfra_model:
+            return await self._deepinfra_model.aembed_query(text)
+
+        raise RuntimeError("No embeddings provider configured")
 
 
 @asynccontextmanager
@@ -27,15 +59,57 @@ async def lifespan(app: FastAPI):
         app.state.hermes_df = None
         logger.error(f"Failed to load Hermes parquet: {e}")
 
-    # Initialize Supabase, Chroma, and related globals used by document_extraction
-    initialize_env()
-
     # Store genai_client in app.state for router access
     # Note: genai_client should be created before passing to lifespan
     if hasattr(app.state, "genai_client"):
         logger.info("genai_client already set in app.state")
     else:
         logger.warning("genai_client not found in app.state")
+
+    # Initialize embeddings model once at startup
+    try:
+        openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        openrouter_client = (
+            AsyncOpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=openrouter_api_key,
+            )
+            if openrouter_api_key
+            else None
+        )
+
+        openrouter_model = os.getenv("OPENROUTER_EMBEDDING_MODEL", "baai/bge-m3")
+
+        openrouter_headers: dict[str, str] = {}
+        openrouter_referer = os.getenv("OPENROUTER_HTTP_REFERER")
+        if openrouter_referer:
+            openrouter_headers["HTTP-Referer"] = openrouter_referer
+        openrouter_title = os.getenv("OPENROUTER_X_TITLE")
+        if openrouter_title:
+            openrouter_headers["X-Title"] = openrouter_title
+
+        deepinfra_api_key = os.getenv("DEEP_INFRA_API_KEY")
+        deepinfra_model = (
+            DeepInfraEmbeddings(
+                model_id="BAAI/bge-m3",
+                query_instruction="",
+                embed_instruction="",
+                deepinfra_api_token=deepinfra_api_key,
+            )
+            if deepinfra_api_key
+            else None
+        )
+
+        app.state.embeddings_model = EmbeddingsProvider(
+            openrouter_client=openrouter_client,
+            openrouter_model=openrouter_model,
+            openrouter_extra_headers=openrouter_headers or None,
+            deepinfra_model=deepinfra_model,
+        )
+        logger.info("Embeddings provider initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize embeddings provider: {e}")
+        app.state.embeddings_model = None
 
     # Create or reuse a shared file search store for document extraction
     store_name = os.getenv("FILE_SEARCH_STORE_NAME")
