@@ -13,6 +13,7 @@ from app.routers import (
     document_extraction,
     document_extraction_pg,
     file_search,
+    pdf,
     search,
     vector_search,
 )
@@ -50,6 +51,7 @@ app.include_router(
 app.include_router(search.router, tags=["search"])
 app.include_router(file_search.router, tags=["file-search"])
 app.include_router(vector_search.router, prefix="/pgvector", tags=["pgvector"])
+app.include_router(pdf.router, prefix="/pdf", tags=["pdf"])
 
 
 @app.get("/")

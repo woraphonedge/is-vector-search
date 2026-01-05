@@ -2,7 +2,7 @@ import logging
 import os
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -23,14 +23,7 @@ class VectorSearchRequest(BaseModel):
     regex_search: Optional[str] = None
     filter_metadata: Optional[Dict[str, Any]] = None
 
-    use_time_decay: bool = False
-    time_decay_grace_days: int = 7
-    time_decay_cutoff_days: int = 180
-    time_decay_lambda: float = 0.2
-
-    use_mmr: bool = False
-    mmr_lambda: float = 0.5
-    mmr_fetch_k: int = 40
+    search_mode: Literal["general", "most_recent"] = "general"
 
 
 class VectorSearchResult(BaseModel):
@@ -43,6 +36,7 @@ class VectorSearchResult(BaseModel):
     page_number: Optional[int] = None
     chunk_type: str
     token_count: Optional[int] = None
+    published_date: Optional[str] = None
 
 
 class DocumentEmbeddingRequest(BaseModel):
@@ -87,6 +81,23 @@ def _cosine(a: List[float], b: List[float]) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return dot / ((na**0.5) * (nb**0.5))
+
+
+def _parse_embedding_value(value: Any) -> List[float]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [float(x) for x in value]
+    if isinstance(value, tuple):
+        return [float(x) for x in value]
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        if not s:
+            return []
+        return [float(x) for x in s.split(",") if x.strip()]
+    return []
 
 
 def _mmr_select(
@@ -185,21 +196,27 @@ async def search_vectors(
             # Convert embedding to PostgreSQL vector format
             embedding_str = f"[{','.join(map(str, query_embedding))}]"
 
-            if request_data.use_time_decay:
-                grace_days = max(0, int(request_data.time_decay_grace_days))
-                cutoff_days = max(1, int(request_data.time_decay_cutoff_days))
-                if grace_days >= cutoff_days:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="time_decay_grace_days must be less than time_decay_cutoff_days",
-                    )
+            if request_data.search_mode not in ("general", "most_recent"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="search_mode must be either 'general' or 'most_recent'",
+                )
 
-                time_decay_lambda = float(request_data.time_decay_lambda)
-                if time_decay_lambda < 0.0 or time_decay_lambda > 1.0:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="time_decay_lambda must be between 0.0 and 1.0",
-                    )
+            use_time_decay = request_data.search_mode == "most_recent"
+            use_mmr = request_data.search_mode in ("general", "most_recent")
+
+            fetch_k = (
+                max(int(request_data.limit) * 8, 40)
+                if use_mmr
+                else int(request_data.limit)
+            )
+
+            if use_time_decay:
+                # Recency-aware ranking (then light de-dup via MMR with a high lambda).
+                # The parameters below are intentionally not exposed to the caller.
+                grace_days = 7
+                cutoff_days = 180
+                time_decay_lambda = 0.2
 
                 # Build the query with a freshness factor derived from published_date.
                 # - No penalty within grace window.
@@ -211,6 +228,7 @@ async def search_vectors(
                             chunk_id,
                             document_id,
                             content,
+                            embedding,
                             file_name,
                             file_md5_checksum,
                             page_number,
@@ -238,11 +256,13 @@ async def search_vectors(
                         document_id,
                         content,
                         (similarity * freshness_factor) AS similarity,
+                        embedding,
                         file_name,
                         file_md5_checksum,
                         page_number,
                         chunk_type,
-                        token_count
+                        token_count,
+                        published_date
                     FROM scored
                     WHERE (similarity * freshness_factor) > $2
                 """
@@ -261,11 +281,13 @@ async def search_vectors(
                         document_id,
                         content,
                         1 - (embedding <=> $1) as similarity,
+                        embedding,
                         file_name,
                         file_md5_checksum,
                         page_number,
                         chunk_type,
-                        token_count
+                        token_count,
+                        published_date
                     FROM document_embeddings
                     WHERE 1 - (embedding <=> $1) > $2
                 """
@@ -294,48 +316,57 @@ async def search_vectors(
                         params.append(str(value))
 
             query += " ORDER BY similarity DESC LIMIT $" + str(len(params) + 1)
-            params.append(request_data.limit)
+            params.append(fetch_k)
 
             rows = await conn.fetch(query, *params)
 
             # prepare candidate dicts (for optional mmr)
             candidates: List[dict] = []
             for row in rows:
+                embedding_value = _parse_embedding_value(row.get("embedding"))
                 candidates.append(
-                {
-                    "chunk_id": row["chunk_id"],
-                    "document_id": row["document_id"],
-                    "content": row["content"],
-                    "similarity": float(row["similarity"]),
-                    "file_name": row["file_name"],
-                    "file_md5_checksum": row["file_md5_checksum"],
-                    "page_number": row["page_number"],
-                    "chunk_type": row["chunk_type"],
-                    "token_count": row["token_count"],
-                }
+                    {
+                        "chunk_id": row["chunk_id"],
+                        "document_id": row["document_id"],
+                        "content": row["content"],
+                        "similarity": float(row["similarity"]),
+                        "embedding": embedding_value,
+                        "file_name": row["file_name"],
+                        "file_md5_checksum": row["file_md5_checksum"],
+                        "page_number": row["page_number"],
+                        "chunk_type": row["chunk_type"],
+                        "token_count": row["token_count"],
+                        "published_date": (
+                            row["published_date"].isoformat()
+                            if row.get("published_date")
+                            else None
+                        ),
+                    }
                 )
 
-            if request_data.use_mmr:
+            if use_mmr:
+                mmr_lambda = 0.5 if request_data.search_mode == "general" else 0.9
                 selected = _mmr_select(
-                query_emb=list(map(float, query_embedding)),
-                candidates=candidates,
-                k=request_data.limit,
-                lambd=float(request_data.mmr_lambda),
+                    query_emb=list(map(float, query_embedding)),
+                    candidates=candidates,
+                    k=request_data.limit,
+                    lambd=float(mmr_lambda),
                 )
             else:
                 selected = candidates[: request_data.limit]
 
             return [
                 VectorSearchResult(
-                chunk_id=c["chunk_id"],
-                document_id=c["document_id"],
-                content=c["content"],
-                similarity=float(c["similarity"]),
-                file_name=c["file_name"],
-                file_md5_checksum=c["file_md5_checksum"],
-                page_number=c["page_number"],
-                chunk_type=c["chunk_type"],
-                token_count=c["token_count"],
+                    chunk_id=c["chunk_id"],
+                    document_id=c["document_id"],
+                    content=c["content"],
+                    similarity=float(c["similarity"]),
+                    file_name=c["file_name"],
+                    file_md5_checksum=c["file_md5_checksum"],
+                    page_number=c["page_number"],
+                    chunk_type=c["chunk_type"],
+                    token_count=c["token_count"],
+                    published_date=c.get("published_date"),
                 )
                 for c in selected
             ]
