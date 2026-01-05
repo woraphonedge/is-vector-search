@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -17,13 +18,19 @@ router = APIRouter()
 
 class VectorSearchRequest(BaseModel):
     query: str
-    query_embedding: Optional[List[float]] = None
-    limit: int = 10
-    threshold: float = 0.7
+    limit: int = 5
+    threshold: float = 0.4
+    regex_search: Optional[str] = None
     filter_metadata: Optional[Dict[str, Any]] = None
+
     use_time_decay: bool = False
     time_decay_grace_days: int = 7
     time_decay_cutoff_days: int = 180
+    time_decay_lambda: float = 0.2
+
+    use_mmr: bool = False
+    mmr_lambda: float = 0.5
+    mmr_fetch_k: int = 40
 
 
 class VectorSearchResult(BaseModel):
@@ -51,6 +58,77 @@ class DocumentEmbeddingRequest(BaseModel):
     chunk_type: str = "unknown"
     token_count: Optional[int] = None
     chroma_document: Optional[str] = None
+
+
+class ChunkIdsRequest(BaseModel):
+    chunk_ids: List[str]
+
+
+class ChunkByIdResult(BaseModel):
+    chunk_id: str
+    document_id: str
+    content: str
+    file_name: str
+    file_md5_checksum: str
+    page_number: Optional[int] = None
+    chunk_type: str
+    token_count: Optional[int] = None
+    published_date: Optional[str] = None
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b, strict=False):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / ((na**0.5) * (nb**0.5))
+
+
+def _mmr_select(
+    query_emb: List[float],
+    candidates: List[dict],
+    k: int,
+    lambd: float,
+) -> List[dict]:
+    # candidates: each dict must have:
+    # - "similarity" (relevance score, already includes time-decay if enabled)
+    # - "embedding" (list[float])
+    if k <= 0 or not candidates:
+        return []
+
+    selected: List[dict] = []
+    selected_embs: List[List[float]] = []
+
+    remaining = candidates[:]
+
+    while remaining and len(selected) < k:
+        best = None
+        best_score = -1e18
+
+        for cand in remaining:
+            rel = float(cand["similarity"])
+            cand_emb = cand["embedding"]
+
+            if not selected_embs:
+                div = 0.0
+            else:
+                div = max(_cosine(cand_emb, e) for e in selected_embs)
+
+            mmr_score = (lambd * rel) - ((1.0 - lambd) * div)
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best = cand
+
+        selected.append(best)
+        selected_embs.append(best["embedding"])
+        remaining.remove(best)
+
+    return selected
 
 
 async def get_embeddings_model():
@@ -82,22 +160,30 @@ async def search_vectors(
     """
     Search for similar documents using vector similarity
     """
-    # Generate embedding if not provided
-    if not request_data.query_embedding:
+    # Generate embedding for the query
+    try:
+        embedding_list = await embeddings_model.aembed_query(request_data.query)
+        query_embedding = embedding_list
+    except Exception as e:
+        logger.error(f"Error generating embedding: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate embedding for query",
+        ) from e
+
+    if request_data.regex_search:
         try:
-            embedding_list = await embeddings_model.aembed_query(request_data.query)
-            request_data.query_embedding = embedding_list
-        except Exception as e:
-            logger.error(f"Error generating embedding: {e}")
+            re.compile(request_data.regex_search)
+        except re.error as e:
             raise HTTPException(
-                status_code=500,
-                detail="Failed to generate embedding for query",
+                status_code=422,
+                detail=f"Invalid regex_search: {request_data.regex_search}. Underlying error: {type(e).__name__}: {e}",
             ) from e
 
     try:
         async with db_pool.acquire() as conn:
             # Convert embedding to PostgreSQL vector format
-            embedding_str = f"[{','.join(map(str, request_data.query_embedding))}]"
+            embedding_str = f"[{','.join(map(str, query_embedding))}]"
 
             if request_data.use_time_decay:
                 grace_days = max(0, int(request_data.time_decay_grace_days))
@@ -108,11 +194,18 @@ async def search_vectors(
                         detail="time_decay_grace_days must be less than time_decay_cutoff_days",
                     )
 
+                time_decay_lambda = float(request_data.time_decay_lambda)
+                if time_decay_lambda < 0.0 or time_decay_lambda > 1.0:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="time_decay_lambda must be between 0.0 and 1.0",
+                    )
+
                 # Build the query with a freshness factor derived from published_date.
                 # - No penalty within grace window.
                 # - Linear decay to 0 at cutoff.
                 # - Exclude older than cutoff.
-                query = """
+                query = """--sql
                     WITH scored AS (
                         SELECT
                             chunk_id,
@@ -128,10 +221,12 @@ async def search_vectors(
                             CASE
                                 WHEN published_date IS NULL THEN 1.0
                                 WHEN NOW() - published_date <= ($3 * INTERVAL '1 day') THEN 1.0
-                                WHEN NOW() - published_date >= ($4 * INTERVAL '1 day') THEN 0.0
+                                WHEN NOW() - published_date >= ($4 * INTERVAL '1 day') THEN (1.0 - $5)
                                 ELSE 1.0 - (
-                                    (EXTRACT(EPOCH FROM (NOW() - published_date)) / 86400.0 - $3)
-                                    / ($4 - $3)
+                                    $5 * (
+                                        (EXTRACT(EPOCH FROM (NOW() - published_date)) / 86400.0 - $3)
+                                        / ($4 - $3)
+                                    )
                                 )
                             END AS freshness_factor
                         FROM document_embeddings
@@ -156,10 +251,11 @@ async def search_vectors(
                     request_data.threshold,
                     grace_days,
                     cutoff_days,
+                    time_decay_lambda,
                 ]
             else:
                 # Build the query (no time decay)
-                query = """
+                query = """--sql
                     SELECT
                         chunk_id,
                         document_id,
@@ -174,6 +270,12 @@ async def search_vectors(
                     WHERE 1 - (embedding <=> $1) > $2
                 """
                 params = [embedding_str, request_data.threshold]
+
+            if request_data.regex_search:
+                query += " AND (content ~* ${} OR file_name ~* ${})".format(
+                    len(params) + 1, len(params) + 1
+                )
+                params.append(request_data.regex_search)
 
             # Whitelist of allowed filter keys to prevent SQL injection
             allowed_filters = {
@@ -196,22 +298,47 @@ async def search_vectors(
 
             rows = await conn.fetch(query, *params)
 
-            results = [
-                VectorSearchResult(
-                    chunk_id=row["chunk_id"],
-                    document_id=row["document_id"],
-                    content=row["content"],
-                    similarity=float(row["similarity"]),
-                    file_name=row["file_name"],
-                    file_md5_checksum=row["file_md5_checksum"],
-                    page_number=row["page_number"],
-                    chunk_type=row["chunk_type"],
-                    token_count=row["token_count"],
+            # prepare candidate dicts (for optional mmr)
+            candidates: List[dict] = []
+            for row in rows:
+                candidates.append(
+                {
+                    "chunk_id": row["chunk_id"],
+                    "document_id": row["document_id"],
+                    "content": row["content"],
+                    "similarity": float(row["similarity"]),
+                    "file_name": row["file_name"],
+                    "file_md5_checksum": row["file_md5_checksum"],
+                    "page_number": row["page_number"],
+                    "chunk_type": row["chunk_type"],
+                    "token_count": row["token_count"],
+                }
                 )
-                for row in rows
-            ]
 
-            return results
+            if request_data.use_mmr:
+                selected = _mmr_select(
+                query_emb=list(map(float, query_embedding)),
+                candidates=candidates,
+                k=request_data.limit,
+                lambd=float(request_data.mmr_lambda),
+                )
+            else:
+                selected = candidates[: request_data.limit]
+
+            return [
+                VectorSearchResult(
+                chunk_id=c["chunk_id"],
+                document_id=c["document_id"],
+                content=c["content"],
+                similarity=float(c["similarity"]),
+                file_name=c["file_name"],
+                file_md5_checksum=c["file_md5_checksum"],
+                page_number=c["page_number"],
+                chunk_type=c["chunk_type"],
+                token_count=c["token_count"],
+                )
+                for c in selected
+            ]
 
     except Exception as e:
         logger.error(f"Error during vector search: {e}")
@@ -282,6 +409,64 @@ async def store_embedding(
 
     except Exception as e:
         logger.error(f"Error storing embedding: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/chunks/by-ids", response_model=List[ChunkByIdResult])
+async def get_chunks_by_ids(
+    request_data: ChunkIdsRequest, db_pool=Depends(get_db_pool)
+):
+    chunk_ids = request_data.chunk_ids
+    if not chunk_ids:
+        return []
+
+    unique_chunk_ids = list(dict.fromkeys(chunk_ids))
+
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """--sql
+                SELECT
+                    t.chunk_id,
+                    de.document_id,
+                    de.content,
+                    de.file_name,
+                    de.file_md5_checksum,
+                    de.page_number,
+                    de.chunk_type,
+                    de.token_count,
+                    de.published_date
+                FROM unnest($1::text[]) WITH ORDINALITY AS t(chunk_id, ord)
+                JOIN document_embeddings de
+                  ON de.chunk_id = t.chunk_id
+                ORDER BY t.ord
+                """,
+                unique_chunk_ids,
+            )
+
+            results: List[ChunkByIdResult] = []
+            for row in rows:
+                results.append(
+                    ChunkByIdResult(
+                        chunk_id=row["chunk_id"],
+                        document_id=row["document_id"],
+                        content=row["content"],
+                        file_name=row["file_name"],
+                        file_md5_checksum=row["file_md5_checksum"],
+                        page_number=row["page_number"],
+                        chunk_type=row["chunk_type"],
+                        token_count=row["token_count"],
+                        published_date=(
+                            row["published_date"].isoformat()
+                            if row["published_date"]
+                            else None
+                        ),
+                    )
+                )
+
+            return results
+    except Exception as e:
+        logger.error(f"Error fetching chunks by ids: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

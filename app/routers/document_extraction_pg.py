@@ -394,6 +394,10 @@ async def list_parsed_documents_pg(db_pool=Depends(get_db_pool)):
             parsed_at = row["parsed_at"] or row["created_at"]
             published_date = row["published_date"]
 
+            pg_job_status = row["job_status"]
+            if pg_job_status in {"completed", "processed"}:
+                pg_job_status = "ready"
+
             results.append(
                 DocumentMetadataWithJob(
                     id=row["id"],
@@ -413,7 +417,7 @@ async def list_parsed_documents_pg(db_pool=Depends(get_db_pool)):
                     created_at=row["created_at"],
                     updated_at=row["updated_at"],
                     pg_job_id=row["job_id"],
-                    pg_job_status=row["job_status"],
+                    pg_job_status=pg_job_status,
                     pg_job_error_message=row["error_message"],
                 )
             )
@@ -525,7 +529,7 @@ async def _upsert_file_metadata(
                 parsed_at, published_date, user_id, product_type, service_type,
                 json_file_path, file_status, json_status
             ) VALUES (
-                $1, $2, $3, $4, $5,
+                $1, $2, $3, $4, $5::jsonb,
                 $6, $7, $8, $9, $10,
                 $11, $12, $13
             )
@@ -548,7 +552,7 @@ async def _upsert_file_metadata(
             file_name,
             type,
             category,
-            tags,
+            json.dumps(tags),
             parsed_at,
             published_date,
             user_id,
@@ -629,15 +633,15 @@ async def _run_extraction_job(
             product_type=product_type,
             service_type=service_type,
             json_file_path=str(parsed_json_path),
-            file_status="processed",
-            json_status="processed",
+            file_status="ready",
+            json_status="ready",
         )
 
         if not documents:
             await _job_set_status(
                 db_pool,
                 job_id,
-                status="completed",
+                status="ready",
                 finished_at=datetime.now(),
                 chunks_processed=0,
                 pages_processed=0,
@@ -694,7 +698,7 @@ async def _run_extraction_job(
         await _job_set_status(
             db_pool,
             job_id,
-            status="completed",
+            status="ready",
             finished_at=datetime.now(),
             chunks_processed=len(documents),
             pages_processed=pages_processed,
@@ -759,7 +763,7 @@ async def create_extraction_job(
 
     published_date: Optional[datetime] = None
     try:
-        published_date = datetime.fromisoformat(publishedDate)
+        published_date = datetime.fromisoformat(publishedDate.replace("Z", "+00:00"))
     except ValueError:
         raise HTTPException(
             status_code=422, detail="Invalid publishedDate format"
