@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from landingai_ade import LandingAIADE
+from landingai_ade import AsyncLandingAIADE
 from langchain_community.embeddings import DeepInfraEmbeddings
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,7 +22,10 @@ logger = logging.getLogger("is_vector_search")
 
 router = APIRouter()
 
-ade_client = LandingAIADE(apikey=os.getenv("VISION_AGENT_API_KEY"))
+ade_async_client = AsyncLandingAIADE(apikey=os.getenv("VISION_AGENT_API_KEY"))
+
+_EXTRACTION_CONCURRENCY = int(os.getenv("PG_EXTRACTION_CONCURRENCY", "2"))
+_EXTRACTION_SEMAPHORE = asyncio.Semaphore(_EXTRACTION_CONCURRENCY)
 
 
 def _get_pg_storage_base_dir() -> Path:
@@ -429,18 +432,38 @@ async def list_parsed_documents_pg(db_pool=Depends(get_db_pool)):
         raise HTTPException(status_code=500, detail="Failed to list documents") from e
 
 
-async def _call_landing_ai_parser(file_content: bytes) -> Dict[str, Any]:
+async def _call_landing_ai_parser(
+    file_content: bytes, *, file_path: str | None = None
+) -> Dict[str, Any]:
     api_key = os.getenv("VISION_AGENT_API_KEY")
     if not api_key:
         raise ValueError(
             "No API key found. Please set the VISION_AGENT_API_KEY environment variable."
         )
 
-    response = ade_client.parse(
-        document=file_content,
-        model="dpt-2",
-    )
-    return response.to_dict()
+    model = os.getenv("VISION_AGENT_MODEL", "dpt-2")
+
+    try:
+        response = await ade_async_client.parse(
+            document=file_content,
+            model=model,
+        )
+    except TypeError:
+        if not file_path:
+            raise
+        response = await ade_async_client.parse(
+            document_url=file_path,
+            model=model,
+        )
+
+    if hasattr(response, "to_dict"):
+        return response.to_dict()
+    if isinstance(response, dict):
+        return response
+    return {
+        "markdown": getattr(response, "markdown", None),
+        "chunks": getattr(response, "chunks", None),
+    }
 
 
 def _embedding_to_pgvector_str(embedding: List[float]) -> str:
@@ -580,133 +603,56 @@ async def _run_extraction_job(
     service_type: Optional[str],
     published_date: Optional[datetime],
 ):
-    started_at = datetime.now()
-    await _job_set_status(
-        db_pool,
-        job_id,
-        status="running",
-        started_at=started_at,
-    )
-
-    try:
-        _ensure_pg_storage_dirs()
-        stored_file_path = Path(file_path)
-        if not stored_file_path.exists():
-            raise FileNotFoundError(
-                f"Stored file not found for {file_md5_checksum}: {stored_file_path}"
-            )
-
-        file_content = stored_file_path.read_bytes()
-        parsed_json = await _call_landing_ai_parser(file_content)
-
-        parsed_json_path = _pg_parsed_json_dir() / f"{file_md5_checksum}.json"
-        parsed_json_path.write_text(json.dumps(parsed_json), encoding="utf-8")
-
-        published_date_str = (
-            published_date.isoformat() if published_date else datetime.now().isoformat()
-        )
-        documents = prepare_document(
-            file_name=file_name,
-            md5_checksum=file_md5_checksum,
-            parsed_json=parsed_json,
-            publishedDate=published_date_str,
-            chunk_type="page",
-        )
-
-        file_id = await _ensure_files_row(
-            db_pool,
-            file_name=file_name,
-            file_md5_checksum=file_md5_checksum,
-            published_date=published_date,
-        )
-
-        await _upsert_file_metadata(
-            db_pool,
-            file_md5_checksum=file_md5_checksum,
-            file_name=file_name,
-            type=type,
-            category=category,
-            tags=tags,
-            parsed_at=datetime.now(),
-            published_date=published_date,
-            user_id=user_id,
-            product_type=product_type,
-            service_type=service_type,
-            json_file_path=str(parsed_json_path),
-            file_status="ready",
-            json_status="ready",
-        )
-
-        if not documents:
-            await _job_set_status(
-                db_pool,
-                job_id,
-                status="ready",
-                finished_at=datetime.now(),
-                chunks_processed=0,
-                pages_processed=0,
-            )
-            return
-
-        contents = [doc.page_content for doc in documents]
-        embeddings = await embeddings_model.aembed_documents(contents)
-
-        pages_processed = len({doc.metadata.get("page_number") for doc in documents})
-
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                for doc, embedding in zip(documents, embeddings, strict=True):
-                    embedding_str = _embedding_to_pgvector_str(embedding)
-                    await conn.execute(
-                        """
-                        INSERT INTO document_embeddings (
-                            chunk_id, file_id, document_id, content, embedding,
-                            file_name, file_md5_checksum, published_date,
-                            page_number, chunk_type, token_count, chroma_document
-                        ) VALUES (
-                            $1, $2, $3, $4, $5,
-                            $6, $7, $8,
-                            $9, $10, $11, $12
-                        )
-                        ON CONFLICT (chunk_id)
-                        DO UPDATE SET
-                            content = EXCLUDED.content,
-                            embedding = EXCLUDED.embedding,
-                            file_name = EXCLUDED.file_name,
-                            file_md5_checksum = EXCLUDED.file_md5_checksum,
-                            published_date = EXCLUDED.published_date,
-                            page_number = EXCLUDED.page_number,
-                            chunk_type = EXCLUDED.chunk_type,
-                            token_count = EXCLUDED.token_count,
-                            chroma_document = EXCLUDED.chroma_document,
-                            updated_at = NOW()
-                        """,
-                        doc.metadata.get("chunk_id"),
-                        file_id,
-                        doc.metadata.get("chunk_id"),
-                        doc.page_content,
-                        embedding_str,
-                        doc.metadata.get("file_name"),
-                        doc.metadata.get("file_md5_checksum"),
-                        published_date,
-                        doc.metadata.get("page_number"),
-                        doc.metadata.get("chunk_type"),
-                        doc.metadata.get("token_count"),
-                        None,
-                    )
-
+    async with _EXTRACTION_SEMAPHORE:
+        started_at = datetime.now()
         await _job_set_status(
             db_pool,
             job_id,
-            status="ready",
-            finished_at=datetime.now(),
-            chunks_processed=len(documents),
-            pages_processed=pages_processed,
+            status="running",
+            started_at=started_at,
         )
 
-    except Exception as e:
-        logger.error(f"Extraction job failed: {e}")
         try:
+            _ensure_pg_storage_dirs()
+            stored_file_path = Path(file_path)
+            if not stored_file_path.exists():
+                raise FileNotFoundError(
+                    f"Stored file not found for {file_md5_checksum}: {stored_file_path}"
+                )
+
+            file_content = await asyncio.to_thread(stored_file_path.read_bytes)
+            parsed_json = await _call_landing_ai_parser(
+                file_content, file_path=str(stored_file_path)
+            )
+
+            parsed_json_path = _pg_parsed_json_dir() / f"{file_md5_checksum}.json"
+            await asyncio.to_thread(
+                parsed_json_path.write_text,
+                json.dumps(parsed_json),
+                encoding="utf-8",
+            )
+
+            published_date_str = (
+                published_date.isoformat()
+                if published_date
+                else datetime.now().isoformat()
+            )
+            documents = await asyncio.to_thread(
+                prepare_document,
+                file_name=file_name,
+                md5_checksum=file_md5_checksum,
+                parsed_json=parsed_json,
+                publishedDate=published_date_str,
+                chunk_type="page",
+            )
+
+            file_id = await _ensure_files_row(
+                db_pool,
+                file_name=file_name,
+                file_md5_checksum=file_md5_checksum,
+                published_date=published_date,
+            )
+
             await _upsert_file_metadata(
                 db_pool,
                 file_md5_checksum=file_md5_checksum,
@@ -714,24 +660,113 @@ async def _run_extraction_job(
                 type=type,
                 category=category,
                 tags=tags,
-                parsed_at=None,
+                parsed_at=datetime.now(),
                 published_date=published_date,
                 user_id=user_id,
                 product_type=product_type,
                 service_type=service_type,
-                json_file_path=None,
-                file_status="failed",
-                json_status="failed",
+                json_file_path=str(parsed_json_path),
+                file_status="ready",
+                json_status="ready",
             )
-        except Exception:
-            logger.exception("Failed to update file_metadata on job failure")
-        await _job_set_status(
-            db_pool,
-            job_id,
-            status="failed",
-            error_message=str(e),
-            finished_at=datetime.now(),
-        )
+
+            if not documents:
+                await _job_set_status(
+                    db_pool,
+                    job_id,
+                    status="ready",
+                    finished_at=datetime.now(),
+                    chunks_processed=0,
+                    pages_processed=0,
+                )
+                return
+
+            contents = [doc.page_content for doc in documents]
+            embeddings = await embeddings_model.aembed_documents(contents)
+
+            pages_processed = len(
+                {doc.metadata.get("page_number") for doc in documents}
+            )
+
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    for doc, embedding in zip(documents, embeddings, strict=True):
+                        embedding_str = _embedding_to_pgvector_str(embedding)
+                        await conn.execute(
+                            """
+                            INSERT INTO document_embeddings (
+                                chunk_id, file_id, document_id, content, embedding,
+                                file_name, file_md5_checksum, published_date,
+                                page_number, chunk_type, token_count, chroma_document
+                            ) VALUES (
+                                $1, $2, $3, $4, $5,
+                                $6, $7, $8,
+                                $9, $10, $11, $12
+                            )
+                            ON CONFLICT (chunk_id)
+                            DO UPDATE SET
+                                content = EXCLUDED.content,
+                                embedding = EXCLUDED.embedding,
+                                file_name = EXCLUDED.file_name,
+                                file_md5_checksum = EXCLUDED.file_md5_checksum,
+                                published_date = EXCLUDED.published_date,
+                                page_number = EXCLUDED.page_number,
+                                chunk_type = EXCLUDED.chunk_type,
+                                token_count = EXCLUDED.token_count,
+                                chroma_document = EXCLUDED.chroma_document,
+                                updated_at = NOW()
+                            """,
+                            doc.metadata.get("chunk_id"),
+                            file_id,
+                            doc.metadata.get("chunk_id"),
+                            doc.page_content,
+                            embedding_str,
+                            doc.metadata.get("file_name"),
+                            doc.metadata.get("file_md5_checksum"),
+                            published_date,
+                            doc.metadata.get("page_number"),
+                            doc.metadata.get("chunk_type"),
+                            doc.metadata.get("token_count"),
+                            None,
+                        )
+
+            await _job_set_status(
+                db_pool,
+                job_id,
+                status="ready",
+                finished_at=datetime.now(),
+                chunks_processed=len(documents),
+                pages_processed=pages_processed,
+            )
+
+        except Exception as e:
+            logger.error(f"Extraction job failed: {e}")
+            try:
+                await _upsert_file_metadata(
+                    db_pool,
+                    file_md5_checksum=file_md5_checksum,
+                    file_name=file_name,
+                    type=type,
+                    category=category,
+                    tags=tags,
+                    parsed_at=None,
+                    published_date=published_date,
+                    user_id=user_id,
+                    product_type=product_type,
+                    service_type=service_type,
+                    json_file_path=None,
+                    file_status="failed",
+                    json_status="failed",
+                )
+            except Exception:
+                logger.exception("Failed to update file_metadata on job failure")
+            await _job_set_status(
+                db_pool,
+                job_id,
+                status="failed",
+                error_message=str(e),
+                finished_at=datetime.now(),
+            )
 
 
 @router.post("/jobs", response_model=CreateExtractionJobResponse)
@@ -757,7 +792,7 @@ async def create_extraction_job(
     stored_file_path = _file_path_for_upload(
         file_md5_checksum=file_md5_checksum, original_filename=file.filename
     )
-    stored_file_path.write_bytes(file_content)
+    await asyncio.to_thread(stored_file_path.write_bytes, file_content)
 
     tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
 
@@ -900,7 +935,8 @@ async def get_parsed_json_pg(file_reference: str, db_pool=Depends(get_db_pool)):
         raise HTTPException(status_code=404, detail="Parsed JSON not found")
 
     try:
-        return json.loads(json_path.read_text(encoding="utf-8"))
+        raw = await asyncio.to_thread(json_path.read_text, encoding="utf-8")
+        return json.loads(raw)
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to read parsed JSON: {e}"
