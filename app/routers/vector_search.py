@@ -581,6 +581,72 @@ async def delete_embedding(chunk_id: str, db_pool=Depends(get_db_pool)):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.delete("/embeddings/by-file/{file_md5_checksum}")
+async def delete_embeddings_by_file(
+    file_md5_checksum: str, db_pool=Depends(get_db_pool)
+):
+    """Delete all embeddings associated with a given file checksum."""
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM document_embeddings
+                WHERE file_md5_checksum = $1
+            """,
+                file_md5_checksum,
+            )
+
+            # asyncpg returns strings like "DELETE 12"
+            deleted = 0
+            try:
+                deleted = int(result.split()[-1])
+            except Exception:
+                deleted = 0
+
+            return {
+                "status": "success",
+                "file_md5_checksum": file_md5_checksum,
+                "deleted": deleted,
+            }
+
+    except Exception as e:
+        logger.error(f"Error deleting embeddings by file: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.delete("/embeddings/by-file/{file_md5_checksum}")
+async def delete_embeddings_by_file(file_md5_checksum: str, db_pool=Depends(get_db_pool)):
+    """Delete all embeddings for a given file checksum."""
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM document_embeddings
+                WHERE file_md5_checksum = $1
+            """,
+                file_md5_checksum,
+            )
+
+            # asyncpg returns strings like "DELETE 0" or "DELETE 123"
+            deleted = 0
+            try:
+                parts = (result or "").split()
+                if len(parts) == 2 and parts[0].upper() == "DELETE":
+                    deleted = int(parts[1])
+            except Exception:
+                deleted = 0
+
+            return {
+                "status": "success",
+                "file_md5_checksum": file_md5_checksum,
+                "deleted": deleted,
+            }
+
+    except Exception as e:
+        logger.error(f"Error deleting embeddings by file: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.get("/embeddings")
 async def list_embeddings(
     limit: int = 100, offset: int = 0, db_pool=Depends(get_db_pool)

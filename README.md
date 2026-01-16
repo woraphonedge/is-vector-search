@@ -5,7 +5,7 @@ A FastAPI service providing document extraction, vector search, and RAG (Retriev
 ## Features
 
 - **Document extraction**: Parse and store documents with metadata
-- **Vector search**: Semantic search using ChromaDB and embeddings
+- **Vector search**: Semantic search using PostgreSQL + pgvector
 - **RAG chat**: Chat with documents using LLM with retrieved context
 - **Google File Search**: Upload and query files via Google Gemini API
 - **Hermes integration**: Search and manage Hermes document corpus
@@ -14,7 +14,7 @@ A FastAPI service providing document extraction, vector search, and RAG (Retriev
 ## Architecture
 
 - **FastAPI**: REST API framework
-- **ChromaDB**: Vector database for semantic search
+- **PostgreSQL + pgvector**: Vector database for semantic search
 - **LangChain**: RAG pipeline and LLM orchestration
 - **OpenAI**: LLM for chat responses
 - **DeepInfra**: Embeddings model
@@ -52,8 +52,12 @@ SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_key
 SUPABASE_SECRET_KEY=your_supabase_secret_key
 
-# ChromaDB
-CHROMA_HOST=localhost
+## Postgres (pgvector)
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=vector_search
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
 
 # Optional: File search store persistence
 FILE_SEARCH_STORE_NAME=your_store_name
@@ -67,13 +71,7 @@ SUPABASE_STORAGE_PREFIX=data
 HERMES_PARQUET_PATH=/path/to/hermes_files_conso.parquet
 ```
 
-### 3. Start ChromaDB
-
-```bash
-docker-compose up -d chromadb
-```
-
-### 4. Run the application
+### 3. Run the application
 
 ```bash
 # Development
@@ -183,11 +181,10 @@ docker-compose logs -f
 
 ## Configuration
 
-### ChromaDB
+### PostgreSQL + pgvector
 
-- Default port: `8000`
-- Collection name: `example_collection`
-- Persistent storage: `./hermes_db` (mounted volume)
+- Default port: `5432` (via docker-compose)
+- Embeddings table: `document_embeddings`
 
 ### Embeddings
 
@@ -203,7 +200,7 @@ docker-compose logs -f
 
 ### Common Issues
 
-1. **ChromaDB connection failed**: Ensure ChromaDB container is running on port 8000
+1. **Postgres connection failed**: Ensure Postgres container is running and healthy
 2. **Supabase errors**: Verify SUPABASE_URL and SUPABASE_KEY are correct
 3. **Embedding failures**: Check DEEP_INFRA_API_KEY is valid
 4. **LLM errors**: Verify OPENAI_API_KEY has sufficient credits
